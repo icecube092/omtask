@@ -3,14 +3,19 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"omtask/external"
 )
 
+// ErrClientStopped returns if client stopped
+var ErrClientStopped = errors.New("client stopped")
+
 type Client interface {
 	Run()
+	// Process handle batch and returns part of batch that cannot be handled now
 	Process(ctx context.Context, batch external.Batch) ([]external.Item, error)
 	Stop()
 }
@@ -21,8 +26,9 @@ type client struct {
 	count           uint64
 	mux             sync.Mutex
 	stopChan        chan struct{}
-	isLimitUpdating bool
-	isRunning       bool
+	isLimitUpdating bool           // when limits on updating, set to true for lock request
+	isRunning       bool           // specify is client running
+	workerUpWg      sync.WaitGroup // wait that all workers up
 }
 
 func New(external external.Service) Client {
@@ -33,24 +39,28 @@ func New(external external.Service) Client {
 		stopChan:        make(chan struct{}),
 		isLimitUpdating: false,
 		isRunning:       false,
+		workerUpWg:      sync.WaitGroup{},
 	}
 }
 
 func (c *client) Run() {
-	n, dur := c.external.GetLimits()
-	c.count = n
-	c.isRunning = true
+	startDuration := c.updateLimit()
 
-	c.watchLimit(dur)
+	c.workerUpWg.Add(1)
+	c.watchLimit(startDuration)
+	c.workerUpWg.Wait()
+
+	c.isRunning = true
 }
 
 func (c *client) watchLimit(startDuration time.Duration) {
 	go func() {
+		c.workerUpWg.Done()
 		ticker := time.NewTicker(startDuration)
 		for {
 			select {
 			case <-ticker.C:
-				c.updateLimit(ticker)
+				ticker.Reset(c.updateLimit())
 			case <-c.stopChan:
 				return
 			}
@@ -58,18 +68,19 @@ func (c *client) watchLimit(startDuration time.Duration) {
 	}()
 }
 
-func (c *client) updateLimit(ticker *time.Ticker) {
+func (c *client) updateLimit() time.Duration {
 	c.isLimitUpdating = true
 	c.mux.Lock()
 	defer c.mux.Unlock()
+	defer func() {
+		c.isLimitUpdating = false
+	}()
 
 	n, dur := c.external.GetLimits()
-	ticker.Reset(dur)
 	c.count = n
-	c.isLimitUpdating = false
-}
 
-var ErrClientStopped = errors.New("client stopped")
+	return dur
+}
 
 func (c *client) Process(ctx context.Context, batch external.Batch) (
 	[]external.Item,
@@ -78,13 +89,13 @@ func (c *client) Process(ctx context.Context, batch external.Batch) (
 	for c.isLimitUpdating {
 		select {
 		case <-ctx.Done():
-			return batch, ctx.Err()
+			return nil, fmt.Errorf("wait limit updating: %w", ctx.Err())
 		default:
 		}
 	}
 
 	if !c.isRunning {
-		return batch, ErrClientStopped
+		return nil, ErrClientStopped
 	}
 
 	c.mux.Lock()
@@ -101,24 +112,20 @@ func (c *client) Process(ctx context.Context, batch external.Batch) (
 		if errors.Is(err, external.ErrBlocked) {
 			return batch, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("external.Process: %w", err)
 	}
 
 	return unhandled, nil
 }
 
 func (c *client) prepare(batch external.Batch) (external.Batch, []external.Item) {
-	var forHandle []external.Item
-	var unhandled []external.Item
-	if c.count >= uint64(len(batch)) {
-		forHandle = make([]external.Item, len(batch))
-	} else {
-		forHandle = make([]external.Item, c.count)
-		unhandled = make([]external.Item, uint64(len(batch))-c.count)
+	size := uint64(len(batch))
+	if c.count < size {
+		size = c.count
 	}
 
-	copy(forHandle, batch)
-	unhandled = batch[len(forHandle):]
+	forHandle := batch[:size]
+	unhandled := batch[len(forHandle):]
 	c.count -= uint64(len(forHandle))
 
 	return forHandle, unhandled
